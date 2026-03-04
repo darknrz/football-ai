@@ -76,5 +76,6 @@ model Prediction {
   value      Float
   threshold  Float?
   prediction String
+  detail     String?
   createdAt  DateTime @default(now())
 }

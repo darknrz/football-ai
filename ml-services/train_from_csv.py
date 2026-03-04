@@ -1,13 +1,18 @@
 """
-train_from_csv_v2.py — Entrena con promedios históricos (sin data leakage)
+train_from_csv_v3.py — Entrena modelos para múltiples umbrales
 
-La diferencia con v1:
-  - Para cada partido, calcula el promedio de los 5 partidos ANTERIORES de cada equipo
-  - Usa esos promedios como features (lo que realmente sabes ANTES del partido)
-  - Evita el data leakage de usar stats del partido actual para predecir ese mismo partido
+Modelos generados:
+  Goles equipo: goals_team_0_5, goals_team_1_5, goals_team_2_5
+  Goles total:  goals_total_0_5, goals_total_1_5, goals_total_2_5, goals_total_3_5, goals_total_4_5
+  Corners equipo: corners_team_2_5, corners_team_3_5, corners_team_4_5, corners_team_5_5
+  Corners total:  corners_total_6_5, corners_total_7_5, corners_total_8_5, corners_total_9_5, corners_total_10_5, corners_total_11_5
+  Tarjetas equipo: cards_team_0_5, cards_team_1_5, cards_team_2_5, cards_team_3_5
+  Tarjetas total:  cards_total_1_5, cards_total_2_5, cards_total_3_5, cards_total_4_5, cards_total_5_5
+  BTTS: btts
+  Ganador: winner
 
 Uso:
-  python train_from_csv_v2.py --folder "C:\\ruta\\data"
+  python train_from_csv_v3.py --folder "C:\\ruta\\data"
 """
 
 import argparse
@@ -17,7 +22,7 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score
 import joblib
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
@@ -35,16 +40,16 @@ XGB_PARAMS = dict(
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--folder", required=True)
-parser.add_argument("--window", type=int, default=5, help="Partidos anteriores a promediar")
+parser.add_argument("--window", type=int, default=5)
 args = parser.parse_args()
 
 print("\n============================================")
-print("  FOOTBALL AI v2 — Sin data leakage")
+print("  FOOTBALL AI v3 — Multi-umbral")
 print("============================================\n")
 
 # ─── Leer CSVs ────────────────────────────────────────────────────
 csv_files = glob.glob(os.path.join(args.folder, "*.csv"))
-print(f"📄 CSVs encontrados: {len(csv_files)}\n")
+print(f"📄 CSVs: {len(csv_files)}\n")
 
 frames = []
 for f in csv_files:
@@ -60,8 +65,6 @@ for f in csv_files:
         print(f"  ⚠️  {os.path.basename(f)} → {e}")
 
 raw = pd.concat(frames, ignore_index=True)
-
-# ─── Columnas estándar ────────────────────────────────────────────
 col_map = {c.strip().upper(): c for c in raw.columns}
 
 def gcol(candidates):
@@ -88,136 +91,156 @@ raw2 = pd.DataFrame({
     "away_fouls": gcol(["AF"]),
 })
 
-# Quitar filas sin goles reales
 raw2 = raw2.dropna(subset=["home_goals", "away_goals", "date"])
 raw2 = raw2[raw2["home_goals"] + raw2["away_goals"] > 0]
 raw2 = raw2.sort_values("date").reset_index(drop=True)
 
 print(f"\n📊 Partidos válidos: {len(raw2)}")
-print(f"   Ventana histórica: últimos {args.window} partidos por equipo\n")
 
-# ─── Calcular promedios históricos por equipo ─────────────────────
-def team_history(df, window=5):
-    """
-    Para cada partido, calcula el promedio de las últimas `window` apariciones
-    del equipo local y visitante ANTES de ese partido.
-    """
-    stats_cols = ["home_goals", "away_goals", "home_shots", "away_shots",
-                  "home_sot", "away_sot", "home_corn", "away_corn",
-                  "home_cards", "away_cards"]
-
-    # Índice: team → lista de (date, stats_as_home, stats_as_away)
-    team_matches: dict = {}
-
+# ─── Historial por equipo ─────────────────────────────────────────
+def build_dataset(df, window=5):
+    team_matches = {}
     features = []
 
-    for idx, row in df.iterrows():
+    for _, row in df.iterrows():
         h, a = row["home"], row["away"]
 
-        def get_avg(team, is_home):
+        def get_avg(team):
             hist = team_matches.get(team, [])
             if not hist:
                 return None
             recent = hist[-window:]
-            vals = {}
-            for m in recent:
-                if m["is_home"]:
-                    vals.setdefault("shots", []).append(m["shots"])
-                    vals.setdefault("sot", []).append(m["sot"])
-                    vals.setdefault("corn", []).append(m["corn"])
-                    vals.setdefault("cards", []).append(m["cards"])
-                    vals.setdefault("gf", []).append(m["gf"])
-                    vals.setdefault("ga", []).append(m["ga"])
-                else:
-                    vals.setdefault("shots", []).append(m["shots"])
-                    vals.setdefault("sot", []).append(m["sot"])
-                    vals.setdefault("corn", []).append(m["corn"])
-                    vals.setdefault("cards", []).append(m["cards"])
-                    vals.setdefault("gf", []).append(m["gf"])
-                    vals.setdefault("ga", []).append(m["ga"])
-            return {k: np.nanmean(v) for k, v in vals.items()}
-
-        h_avg = get_avg(h, True)
-        a_avg = get_avg(a, False)
-
-        if h_avg and a_avg:
-            feat = {
-                "home_avg_shots":           h_avg.get("shots", 13.0),
-                "away_avg_shots":           a_avg.get("shots", 11.0),
-                "home_avg_shots_on_target": h_avg.get("sot",   4.5),
-                "away_avg_shots_on_target": a_avg.get("sot",   3.8),
-                "home_avg_corners":         h_avg.get("corn",  5.2),
-                "away_avg_corners":         a_avg.get("corn",  4.8),
-                "home_avg_cards":           h_avg.get("cards", 1.8),
-                "away_avg_cards":           a_avg.get("cards", 1.6),
-                # Targets
-                "total_goals":   row["home_goals"] + row["away_goals"],
-                "total_corners": row["home_corn"] + row["away_corn"] if pd.notna(row["home_corn"]) else np.nan,
-                "total_cards":   row["home_cards"] + row["away_cards"] if pd.notna(row["home_cards"]) else np.nan,
-                "home_goals":    row["home_goals"],
-                "away_goals":    row["away_goals"],
+            return {
+                "shots":  np.nanmean([m["shots"]  for m in recent]),
+                "sot":    np.nanmean([m["sot"]    for m in recent]),
+                "corn":   np.nanmean([m["corn"]   for m in recent]),
+                "cards":  np.nanmean([m["cards"]  for m in recent]),
+                "gf":     np.nanmean([m["gf"]     for m in recent]),
+                "ga":     np.nanmean([m["ga"]     for m in recent]),
             }
-            features.append(feat)
 
-        # Actualizar historial
-        for team, is_home, shots, sot, corn, cards, gf, ga in [
-            (h, True,  row["home_shots"], row["home_sot"], row["home_corn"], row["home_cards"], row["home_goals"], row["away_goals"]),
-            (a, False, row["away_shots"], row["away_sot"], row["away_corn"], row["away_cards"], row["away_goals"], row["home_goals"]),
+        ha = get_avg(h)
+        aa = get_avg(a)
+
+        if ha and aa:
+            features.append({
+                # Features
+                "home_avg_shots":   ha["shots"], "away_avg_shots":   aa["shots"],
+                "home_avg_sot":     ha["sot"],   "away_avg_sot":     aa["sot"],
+                "home_avg_corners": ha["corn"],  "away_avg_corners": aa["corn"],
+                "home_avg_cards":   ha["cards"], "away_avg_cards":   aa["cards"],
+                "home_avg_gf":      ha["gf"],    "away_avg_gf":      aa["gf"],
+                "home_avg_ga":      ha["ga"],    "away_avg_ga":      aa["ga"],
+                # Raw results for targets
+                "home_goals":  row["home_goals"],
+                "away_goals":  row["away_goals"],
+                "home_corn":   row["home_corn"],
+                "away_corn":   row["away_corn"],
+                "home_cards":  row["home_cards"],
+                "away_cards":  row["away_cards"],
+            })
+
+        for team, gf, ga, shots, sot, corn, cards in [
+            (h, row["home_goals"], row["away_goals"], row["home_shots"], row["home_sot"], row["home_corn"], row["home_cards"]),
+            (a, row["away_goals"], row["home_goals"], row["away_shots"], row["away_sot"], row["away_corn"], row["away_cards"]),
         ]:
             team_matches.setdefault(team, []).append({
-                "is_home": is_home,
-                "shots": shots, "sot": sot, "corn": corn,
-                "cards": cards, "gf": gf, "ga": ga,
+                "gf": gf, "ga": ga, "shots": shots,
+                "sot": sot, "corn": corn, "cards": cards,
             })
 
     return pd.DataFrame(features)
 
-data = team_history(raw2, window=args.window)
+data = build_dataset(raw2, window=args.window)
 data = data.dropna().reset_index(drop=True)
-
-print(f"   Partidos con historial suficiente: {len(data)}\n")
-
-# ─── Targets ──────────────────────────────────────────────────────
-data["over_2_5"]        = (data["total_goals"]   > 2.5).astype(int)
-data["over_8_5_corners"]= (data["total_corners"] > 8.5).astype(int)
-data["over_3_5_cards"]  = (data["total_cards"]   > 3.5).astype(int)
-data["btts"]            = ((data["home_goals"] > 0) & (data["away_goals"] > 0)).astype(int)
-data["winner"]          = np.where(data["home_goals"] > data["away_goals"], 1,
-                          np.where(data["home_goals"] < data["away_goals"], 2, 0))
+print(f"   Con historial: {len(data)}\n")
 
 FEATURE_COLS = [
     "home_avg_shots", "away_avg_shots",
-    "home_avg_shots_on_target", "away_avg_shots_on_target",
+    "home_avg_sot",   "away_avg_sot",
     "home_avg_corners", "away_avg_corners",
     "home_avg_cards", "away_avg_cards",
+    "home_avg_gf",    "away_avg_gf",
+    "home_avg_ga",    "away_avg_ga",
 ]
 
 X = data[FEATURE_COLS].fillna(0)
 
-print(f"   Over 2.5 goles    : {data['over_2_5'].sum()} ({round(data['over_2_5'].mean()*100)}%)")
-print(f"   Over 8.5 corners  : {data['over_8_5_corners'].sum()} ({round(data['over_8_5_corners'].mean()*100)}%)")
-print(f"   Over 3.5 tarjetas : {data['over_3_5_cards'].sum()} ({round(data['over_3_5_cards'].mean()*100)}%)")
-print(f"   BTTS              : {data['btts'].sum()} ({round(data['btts'].mean()*100)}%)")
+# ─── Targets ──────────────────────────────────────────────────────
+total_goals   = data["home_goals"]   + data["away_goals"]
+total_corners = data["home_corn"]    + data["away_corn"]
+total_cards   = data["home_cards"]   + data["away_cards"]
+
+targets = {
+    # Goles equipo local
+    "goals_home_0_5": (data["home_goals"] > 0.5).astype(int),
+    "goals_home_1_5": (data["home_goals"] > 1.5).astype(int),
+    "goals_home_2_5": (data["home_goals"] > 2.5).astype(int),
+    # Goles equipo visitante
+    "goals_away_0_5": (data["away_goals"] > 0.5).astype(int),
+    "goals_away_1_5": (data["away_goals"] > 1.5).astype(int),
+    "goals_away_2_5": (data["away_goals"] > 2.5).astype(int),
+    # Goles totales
+    "goals_total_0_5": (total_goals > 0.5).astype(int),
+    "goals_total_1_5": (total_goals > 1.5).astype(int),
+    "goals_total_2_5": (total_goals > 2.5).astype(int),
+    "goals_total_3_5": (total_goals > 3.5).astype(int),
+    "goals_total_4_5": (total_goals > 4.5).astype(int),
+    # Corners equipo local
+    "corners_home_2_5": (data["home_corn"] > 2.5).astype(int),
+    "corners_home_3_5": (data["home_corn"] > 3.5).astype(int),
+    "corners_home_4_5": (data["home_corn"] > 4.5).astype(int),
+    "corners_home_5_5": (data["home_corn"] > 5.5).astype(int),
+    # Corners equipo visitante
+    "corners_away_2_5": (data["away_corn"] > 2.5).astype(int),
+    "corners_away_3_5": (data["away_corn"] > 3.5).astype(int),
+    "corners_away_4_5": (data["away_corn"] > 4.5).astype(int),
+    "corners_away_5_5": (data["away_corn"] > 5.5).astype(int),
+    # Corners totales
+    "corners_total_6_5":  (total_corners > 6.5).astype(int),
+    "corners_total_7_5":  (total_corners > 7.5).astype(int),
+    "corners_total_8_5":  (total_corners > 8.5).astype(int),
+    "corners_total_9_5":  (total_corners > 9.5).astype(int),
+    "corners_total_10_5": (total_corners > 10.5).astype(int),
+    "corners_total_11_5": (total_corners > 11.5).astype(int),
+    # Tarjetas equipo local
+    "cards_home_0_5": (data["home_cards"] > 0.5).astype(int),
+    "cards_home_1_5": (data["home_cards"] > 1.5).astype(int),
+    "cards_home_2_5": (data["home_cards"] > 2.5).astype(int),
+    "cards_home_3_5": (data["home_cards"] > 3.5).astype(int),
+    # Tarjetas equipo visitante
+    "cards_away_0_5": (data["away_cards"] > 0.5).astype(int),
+    "cards_away_1_5": (data["away_cards"] > 1.5).astype(int),
+    "cards_away_2_5": (data["away_cards"] > 2.5).astype(int),
+    "cards_away_3_5": (data["away_cards"] > 3.5).astype(int),
+    # Tarjetas totales
+    "cards_total_1_5": (total_cards > 1.5).astype(int),
+    "cards_total_2_5": (total_cards > 2.5).astype(int),
+    "cards_total_3_5": (total_cards > 3.5).astype(int),
+    "cards_total_4_5": (total_cards > 4.5).astype(int),
+    "cards_total_5_5": (total_cards > 5.5).astype(int),
+    # BTTS
+    "btts": ((data["home_goals"] > 0) & (data["away_goals"] > 0)).astype(int),
+    # Ganador
+    "winner": np.where(data["home_goals"] > data["away_goals"], 1,
+              np.where(data["home_goals"] < data["away_goals"], 2, 0)),
+}
 
 # ─── Entrenar ─────────────────────────────────────────────────────
-def train_binary(target, name, label):
-    y = data[target].astype(int)
+print("🏋️  Entrenando modelos...\n")
+
+def train_binary(name, y):
     if y.nunique() < 2:
-        print(f"⚠️  {label}: solo una clase, saltando")
+        print(f"  ⚠️  {name}: una sola clase, saltando")
         return
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
     model = xgb.XGBClassifier(**XGB_PARAMS, eval_metric="logloss")
     model.fit(X_tr, y_tr)
-    preds = model.predict(X_te)
-    acc   = accuracy_score(y_te, preds)
-    print(f"\n📊 {label}")
-    print(f"   Accuracy: {acc:.3f} ({round(acc*100,1)}%)")
-    print(classification_report(y_te, preds, zero_division=0))
+    acc = accuracy_score(y_te, model.predict(X_te))
     joblib.dump(model, os.path.join(MODELS_DIR, f"{name}.pkl"))
-    print(f"   ✅ models/{name}.pkl")
+    print(f"  ✅ {name}: {round(acc*100,1)}%")
 
-def train_multiclass(target, name, label):
-    y = data[target].astype(int)
+def train_multiclass(name, y):
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
     model = xgb.XGBClassifier(
         **XGB_PARAMS,
@@ -226,23 +249,17 @@ def train_multiclass(target, name, label):
         eval_metric="mlogloss"
     )
     model.fit(X_tr, y_tr)
-    preds = model.predict(X_te)
-    acc   = accuracy_score(y_te, preds)
-    print(f"\n📊 {label}")
-    print(f"   Accuracy: {acc:.3f} ({round(acc*100,1)}%)")
-    print(classification_report(y_te, preds, zero_division=0))
+    acc = accuracy_score(y_te, model.predict(X_te))
     joblib.dump(model, os.path.join(MODELS_DIR, f"{name}.pkl"))
-    print(f"   ✅ models/{name}.pkl")
+    print(f"  ✅ {name}: {round(acc*100,1)}%")
 
-print("\n🏋️  Entrenando modelos...\n")
-train_binary("over_2_5",          "goals",   "Over 2.5 Goles")
-train_binary("over_8_5_corners",  "corners", "Over 8.5 Corners")
-train_binary("over_3_5_cards",    "cards",   "Over 3.5 Tarjetas")
-train_binary("btts",              "btts",    "BTTS")
-train_multiclass("winner",        "winner",  "Ganador")
+for name, y in targets.items():
+    if name == "winner":
+        train_multiclass(name, pd.Series(y))
+    else:
+        train_binary(name, pd.Series(y).astype(int))
 
-print("\n============================================")
-print("  ✅ LISTO — modelos sin data leakage")
-print("============================================")
-print("  Reinicia el ML Service para cargar los nuevos modelos")
-print("")
+print(f"\n============================================")
+print(f"  ✅ {len(targets)} modelos entrenados")
+print(f"============================================")
+print("  Reinicia el ML Service\n")

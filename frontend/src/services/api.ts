@@ -36,6 +36,7 @@ export interface Prediction {
   threshold: number | null
   prediction: string
   createdAt: string
+  detail: string | null
 }
 
 export interface Match {
